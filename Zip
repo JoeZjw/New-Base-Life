@@ -1,0 +1,400 @@
+# Copy to .env and fill values
+BASE_RPC_URL="https://base-goerli.example.rpc" # or Base mainnet RPC
+PRIVATE_KEY="0xYOUR_PRIVATE_KEY"
+ETHERSCAN_API_KEY="" # optional
+
+{
+  "name": "zip-game-base",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy:baseTestnet": "hardhat run --network baseTestnet scripts/deploy.js",
+    "deploy:baseMainnet": "hardhat run --network baseMainnet scripts/deploy.js",
+    "start-frontend": "serve frontend -l 3000"
+  },
+  "dependencies": {
+    "dotenv": "^16.0.0",
+    "ethers": "^6.9.0"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^3.0.0",
+    "hardhat": "^2.17.0",
+    "serve": "^14.0.1",
+    "@openzeppelin/contracts": "^4.9.2"
+  }
+}
+
+require("dotenv").config();
+require("@nomicfoundation/hardhat-toolbox");
+
+const { BASE_RPC_URL, PRIVATE_KEY, ETHERSCAN_API_KEY } = process.env;
+
+module.exports = {
+  solidity: "0.8.18",
+  networks: {
+    hardhat: {},
+    // Example Base testnet/mainnet entries. Replace RPC URLs with your provider.
+    baseTestnet: {
+      url: BASE_RPC_URL || "https://base-goerli.public-rpc.example",
+      accounts: PRIVATE_KEY ? [PRIVATE_KEY.startsWith("0x") ? PRIVATE_KEY : "0x" + PRIVATE_KEY] : []
+    },
+    baseMainnet: {
+      url: BASE_RPC_URL || "https://base-mainnet.public-rpc.example",
+      accounts: PRIVATE_KEY ? [PRIVATE_KEY.startsWith("0x") ? PRIVATE_KEY : "0x" + PRIVATE_KEY] : []
+    }
+  },
+  etherscan: {
+    // If Base is supported by this plugin at runtime/2025, set the API key. Otherwise skip verification steps.
+    apiKey: ETHERSCAN_API_KEY || ""
+  }
+};
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.18;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+/// @title Zip Game (simple round-based lottery)
+/// @notice Demo game: owner starts a round; players join by paying entry fee; after round end a pseudo-random winner is chosen
+contract ZipGame is Ownable {
+    struct Round {
+        uint256 entryFee;
+        uint256 maxPlayers;
+        uint256 deadline; // timestamp when round ends
+        address[] players;
+        bool finalized;
+        address winner;
+    }
+
+    uint256 public platformFeeBasis = 200; // 2.00% fee (basis points)
+    uint256 public constant BASIS = 10000;
+    uint256 public roundCounter;
+    mapping(uint256 => Round) public rounds;
+
+    event RoundStarted(uint256 indexed roundId, uint256 entryFee, uint256 maxPlayers, uint256 deadline);
+    event PlayerJoined(uint256 indexed roundId, address indexed player);
+    event RoundFinalized(uint256 indexed roundId, address indexed winner, uint256 pot);
+    event PlatformFeeWithdrawn(address indexed to, uint256 amount);
+    event PlatformFeeUpdated(uint256 newFeeBasis);
+
+    modifier roundExists(uint256 roundId) {
+        require(roundId <= roundCounter && roundId > 0, "Round does not exist");
+        _;
+    }
+
+    /// @notice Start a new round
+    /// @param entryFee Payment required to join (in wei)
+    /// @param maxPlayers Max players allowed for this round
+    /// @param durationSeconds How long the round lasts from now
+    function startRound(uint256 entryFee, uint256 maxPlayers, uint256 durationSeconds) external onlyOwner {
+        require(entryFee > 0, "entryFee must be > 0");
+        require(maxPlayers > 0, "maxPlayers > 0");
+        require(durationSeconds > 0, "duration > 0");
+
+        roundCounter++;
+        Round storage r = rounds[roundCounter];
+        r.entryFee = entryFee;
+        r.maxPlayers = maxPlayers;
+        r.deadline = block.timestamp + durationSeconds;
+
+        emit RoundStarted(roundCounter, entryFee, maxPlayers, r.deadline);
+    }
+
+    /// @notice Join an active round by sending exactly entryFee
+    /// @param roundId The round to join
+    function joinRound(uint256 roundId) external payable roundExists(roundId) {
+        Round storage r = rounds[roundId];
+        require(block.timestamp < r.deadline, "Round ended");
+        require(!r.finalized, "Round finalized");
+        require(msg.value == r.entryFee, "Incorrect entry fee");
+        require(r.players.length < r.maxPlayers, "Round full");
+
+        r.players.push(msg.sender);
+        emit PlayerJoined(roundId, msg.sender);
+    }
+
+    /// @notice Finalize the round and pick a winner when conditions met
+    /// @param roundId The round to finalize
+    function finalizeRound(uint256 roundId) external roundExists(roundId) {
+        Round storage r = rounds[roundId];
+        require(!r.finalized, "Already finalized");
+        require(r.players.length > 0, "No players");
+        require(block.timestamp >= r.deadline || r.players.length == r.maxPlayers, "Round still active");
+
+        // Pseudo-random selection (for demo only)
+        bytes32 hash = keccak256(abi.encodePacked(blockhash(block.number - 1), block.timestamp, r.players.length, r.entryFee));
+        uint256 winnerIndex = uint256(hash) % r.players.length;
+        address winner = r.players[winnerIndex];
+        r.winner = winner;
+        r.finalized = true;
+
+        uint256 pot = r.entryFee * r.players.length;
+        uint256 fee = (pot * platformFeeBasis) / BASIS;
+        uint256 payout = pot - fee;
+
+        // Transfer payout to winner
+        (bool ok1, ) = winner.call{value: payout}("");
+        require(ok1, "Payout failed");
+
+        emit RoundFinalized(roundId, winner, pot);
+    }
+
+    /// @notice Withdraw accumulated platform fees
+    function withdrawFees(address payable to) external onlyOwner {
+        uint256 bal = address(this).balance;
+        require(bal > 0, "No fees");
+        (bool ok, ) = to.call{value: bal}("");
+        require(ok, "Withdraw failed");
+        emit PlatformFeeWithdrawn(to, bal);
+    }
+
+    /// @notice Update platform fee (in basis points)
+    function setPlatformFeeBasis(uint256 newBasis) external onlyOwner {
+        require(newBasis <= 1000, "Fee too high"); // <=10%
+        platformFeeBasis = newBasis;
+        emit PlatformFeeUpdated(newBasis);
+    }
+
+    /// @notice Get players of a round
+    function getPlayers(uint256 roundId) external view roundExists(roundId) returns (address[] memory) {
+        return rounds[roundId].players;
+    }
+
+    // allow contract to receive plain ETH (e.g., fees)
+    receive() external payable {}
+}
+
+const hre = require("hardhat");
+require("dotenv").config();
+
+async function main() {
+  const [deployer] = await hre.ethers.getSigners();
+  console.log("Deploying with", deployer.address);
+
+  const ZipGame = await hre.ethers.getContractFactory("ZipGame");
+  const zip = await ZipGame.deploy();
+  await zip.deployed();
+
+  console.log("ZipGame deployed to:", zip.address);
+
+  // Save address for frontend convenience
+  const fs = require("fs");
+  fs.writeFileSync("deployments.txt", `ZipGame=${zip.address}\n`);
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Zip Game — Frontend</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>Zip Game</h1>
+    <div id="wallet">Not connected</div>
+
+    <div class="control">
+      <input id="contractAddr" placeholder="Paste contract address" />
+      <button id="connectBtn">Connect Wallet</button>
+    </div>
+
+    <div id="ownerControls" style="display:none;">
+      <h2>Owner Controls</h2>
+      <input id="entryFee" placeholder="entryFee (wei)" />
+      <input id="maxPlayers" placeholder="maxPlayers" />
+      <input id="duration" placeholder="durationSeconds" />
+      <button id="startRoundBtn">Start Round</button>
+      <button id="withdrawBtn">Withdraw Fees</button>
+    </div>
+
+    <div>
+      <h2>Join Round</h2>
+      <input id="joinRoundId" placeholder="Round ID (number)" />
+      <button id="joinBtn">Join</button>
+    </div>
+
+    <div>
+      <h2>Finalize Round</h2>
+      <input id="finalRoundId" placeholder="Round ID" />
+      <button id="finalizeBtn">Finalize</button>
+    </div>
+
+    <div>
+      <h2>Info</h2>
+      <pre id="info"></pre>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/ethers@6.9.0/dist/ethers.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
+
+# Zip Game — Deployable to Base Chain
+
+A minimal blockchain "Zip" game (lottery/race-style) smart contract + simple frontend that can be deployed to Base (testnet/mainnet). This repo includes:
+
+- Solidity contract: `contracts/ZipGame.sol`
+- Hardhat scripts to compile and deploy
+- Simple web frontend (vanilla JS) to interact with the contract
+- Instructions to deploy to Base and run locally
+
+This project is meant as a demonstration and NOT production-ready (randomness uses blockhash, which can be manipulated by miners; do not use for high-value games).
+
+Quick features
+- Start a round with entry price, max players, and duration
+- Players join by sending entryFee
+- After round ends anyone can finalize the round; winner chosen pseudo-randomly from participants
+- Winner receives the pot minus a small platform fee that owner can withdraw
+
+Prerequisites
+- Node.js >= 18
+- yarn or npm
+- A Base RPC URL (Base testnet/mainnet or Base Goerli depending on current network naming). Use a provider like Alchemy/Infura or a public RPC.
+- Private key with testnet funds for deployment
+
+Files
+- contracts/ZipGame.sol — solidity game contract
+- hardhat.config.js — Hardhat config (networks use env vars)
+- scripts/deploy.js — deployment script
+- frontend/* — static frontend to interact with the contract
+
+Usage
+
+1) Clone or copy files, then install deps:
+   - yarn install
+   or
+   - npm install
+
+2) Create a `.env` file (copy from `.env.example`) and set:
+   - BASE_RPC_URL — RPC endpoint for Base testnet or mainnet
+   - PRIVATE_KEY — deployer private key (without 0x or with — accepted by Hardhat)
+   - ETHERSCAN_API_KEY — optional (for verifying on Etherscan if supported for Base)
+
+3) Compile:
+   - npx hardhat compile
+
+4) Deploy to Base (example):
+   - npx hardhat run --network baseTestnet scripts/deploy.js
+
+   After deploy you'll see the contract address. Use the frontend to interact.
+
+Frontend
+- Serve the `frontend` folder (e.g., npx http-server frontend) or open `frontend/index.html` directly (Metamask allows local file access depending on browser).
+- The frontend expects you to paste the deployed contract address (or the script outputs one into `deployments.txt` if you save it).
+
+Security notes
+- Randomness uses blockhash and is not secure for high-value games.
+- Owner controls starting rounds and withdrawing fees.
+- Always audit contracts before production use.
+
+If you'd like, I can:
+- Add Chainlink VRF integration for secure randomness
+- Add unit tests and CI
+- Convert to a full React frontend
+- Bundle everything into a ready-to-download ZIP
+
+Next: I included all files below. Follow the README to set env and deploy.
+
+const provider = new ethers.BrowserProvider(window.ethereum);
+let signer, contract;
+
+const abi = [
+  "function startRound(uint256 entryFee, uint256 maxPlayers, uint256 durationSeconds) external",
+  "function joinRound(uint256 roundId) external payable",
+  "function finalizeRound(uint256 roundId) external",
+  "function withdrawFees(address payable to) external",
+  "function owner() view returns (address)",
+  "function roundCounter() view returns (uint256)",
+  "function rounds(uint256) view returns (uint256 entryFee, uint256 maxPlayers, uint256 deadline, bool finalized, address winner)",
+  "event RoundStarted(uint256 indexed roundId, uint256 entryFee, uint256 maxPlayers, uint256 deadline)",
+  "event PlayerJoined(uint256 indexed roundId, address indexed player)",
+  "event RoundFinalized(uint256 indexed roundId, address indexed winner, uint256 pot)"
+];
+
+async function connect() {
+  await provider.send("eth_requestAccounts", []);
+  signer = await provider.getSigner();
+  document.getElementById("wallet").innerText = "Connected: " + await signer.getAddress();
+}
+
+async function loadContract() {
+  const addr = document.getElementById("contractAddr").value.trim();
+  if (!addr) { alert("Enter contract address"); return; }
+  contract = new ethers.Contract(addr, abi, signer || provider);
+  const owner = await contract.owner();
+  const user = signer ? await signer.getAddress() : null;
+  document.getElementById("info").innerText = `Contract: ${addr}\nOwner: ${owner}\nYour addr: ${user || "not connected"}`;
+  if (user && owner.toLowerCase() === user.toLowerCase()) {
+    document.getElementById("ownerControls").style.display = "block";
+  } else {
+    document.getElementById("ownerControls").style.display = "none";
+  }
+}
+
+document.getElementById("connectBtn").onclick = async () => {
+  try {
+    await connect();
+    await loadContract();
+  } catch (e) { alert(e.message); }
+};
+
+document.getElementById("startRoundBtn").onclick = async () => {
+  try {
+    const entryFee = document.getElementById("entryFee").value;
+    const maxPlayers = document.getElementById("maxPlayers").value;
+    const duration = document.getElementById("duration").value;
+    const tx = await contract.connect(await signer).startRound(entryFee, maxPlayers, duration);
+    await tx.wait();
+    alert("Round started");
+  } catch (e) { alert(e.message); }
+};
+
+document.getElementById("joinBtn").onclick = async () => {
+  try {
+    const roundId = document.getElementById("joinRoundId").value;
+    // fetch entryFee from rounds mapping (note limited tuple data - call via function if needed)
+    // Simpler: user should know entry price; we prompt for value if needed.
+    const entryFeeInput = prompt("Send amount in wei (entry fee) to join:");
+    if (!entryFeeInput) return;
+    const tx = await contract.connect(await signer).joinRound(roundId, { value: BigInt(entryFeeInput) });
+    await tx.wait();
+    alert("Joined round");
+  } catch (e) { alert(e.message); }
+};
+
+document.getElementById("finalizeBtn").onclick = async () => {
+  try {
+    const roundId = document.getElementById("finalRoundId").value;
+    const tx = await contract.connect(await signer).finalizeRound(roundId);
+    await tx.wait();
+    alert("Finalized");
+  } catch (e) { alert(e.message); }
+};
+
+document.getElementById("withdrawBtn").onclick = async () => {
+  try {
+    const to = await signer.getAddress();
+    const tx = await contract.connect(await signer).withdrawFees(to);
+    await tx.wait();
+    alert("Withdrawn");
+  } catch (e) { alert(e.message); }
+};
+
+// load contract when address set and wallet connected
+document.getElementById("contractAddr").addEventListener("change", loadContract);
+
+node_modules
+.env
+deployments.txt
+cache
+artifacts
