@@ -1,3 +1,4 @@
+# This is to test the requirement of having at least one committ
 # Copy to .env and fill values
 BASE_RPC_URL="https://base-goerli.example.rpc" # or Base mainnet RPC
 PRIVATE_KEY="0xYOUR_PRIVATE_KEY"
